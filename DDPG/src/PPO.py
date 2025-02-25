@@ -122,7 +122,7 @@ class Critic(tf.keras.Model):
 
 
 class WAMVEnv:
-    def __init__(self, lidar_points=360, max_episode_steps=500, target_distance=20.0):
+    def __init__(self, lidar_points=360, max_episode_steps=1000, target_distance=20.0):
         # 状态和动作空间定义
         self.lidar_points = lidar_points  # 使用激光雷达点的数量
         self.observation_space = spaces.Box(low=0, high=100, shape=(lidar_points + 1,), dtype=np.float32)  # +1 for distance traveled
@@ -224,6 +224,22 @@ class WAMVEnv:
             self.previous_lidar_scan = self.current_lidar_scan.copy()
             self.current_lidar_scan = ranges
     
+    def get_front_indices(self):
+        """获取船舶前方区域的激光雷达索引，正确处理环绕情况"""
+        start = int(self.lidar_points * 11/12)
+        end = int(self.lidar_points * 1/12)
+        
+        # 处理环绕情况
+        if start > end:
+            # 环绕情况：创建两段范围 (start到lidar_points-1 和 0到end)
+            indices = [i % self.lidar_points for i in range(start, self.lidar_points)]
+            indices.extend([i for i in range(0, end)])
+        else:
+            # 正常情况
+            indices = [i for i in range(start, end)]
+            
+        return indices
+    
     def get_wamv_position(self):
         """获取WAM-V当前位置"""
         if self.get_model_state is None:
@@ -246,19 +262,36 @@ class WAMVEnv:
         if self.start_position is None or self.current_position is None:
             return 0.0
             
-        # 计算在起始点朝向方向上的位移
-        dx = self.current_position.x - self.start_position.x
-        dy = self.current_position.y - self.start_position.y
-        
-        # 简单使用欧几里得距离，因为我们已经将船初始方向设为前进方向
-        distance = math.sqrt(dx**2 + dy**2)
-        
-        return distance
+        # 添加额外检查
+        if hasattr(self.start_position, 'x') and hasattr(self.current_position, 'x'):
+            # 计算在起始点朝向方向上的位移
+            dx = self.current_position.x - self.start_position.x
+            dy = self.current_position.y - self.start_position.y
+            
+            # 简单使用欧几里得距离
+            distance = math.sqrt(dx**2 + dy**2)
+            
+            # 防止NaN
+            if np.isnan(distance) or np.isinf(distance):
+                rospy.logwarn("距离计算出现NaN，使用0.0")
+                return 0.0
+                
+            return max(0.0, distance)  # 确保距离为非负
+        else:
+            rospy.logwarn("位置对象缺少x/y属性")
+            return 0.0
         
     def reset(self):
         """重置环境，将船移动到指定的初始位置和朝向"""
+        rospy.loginfo("重置环境开始...")
+        
         # 发送零推力命令以停止船只
         self.send_thrust_cmd(0.0, 0.0)
+        
+        # 打印重置前的位置
+        prev_pos = self.get_wamv_position()
+        if prev_pos:
+            rospy.loginfo(f"重置前位置: x={prev_pos.x:.2f}, y={prev_pos.y:.2f}")
         
         # 重置状态变量
         self.collision_detected = False
@@ -268,18 +301,20 @@ class WAMVEnv:
         self.distance_traveled = 0.0
         
         # 重置船的位置到指定坐标和朝向
-        self.reset_wamv_position(x=100.0, y=28.0, z=0.0, yaw=-2.7)
+        success = self.reset_wamv_position(x=100.0, y=28.0, z=0.0, yaw=-2.7)
+        rospy.loginfo(f"位置重置{'成功' if success else '失败'}")
         
         # 等待新的激光雷达数据
-        time.sleep(1.0)  # 增加等待时间，确保船位置重置后能获取新数据
+        time.sleep(1.5)  # 增加等待时间，确保船位置重置后能获取新数据
         
         # 记录起始位置
         self.start_position = self.get_wamv_position()
+        if self.start_position:
+            rospy.loginfo(f"新起始位置: x={self.start_position.x:.2f}, y={self.start_position.y:.2f}")
+        else:
+            rospy.logerr("无法获取起始位置!")
         self.current_position = self.start_position
         
-        if self.start_position is None:
-            rospy.logwarn("无法获取起始位置，使用默认值")
-            
         # 返回初始观测 (激光雷达数据 + 已行驶距离/目标距离)
         with self.lidar_lock:
             lidar_data = self.current_lidar_scan.copy()
@@ -337,10 +372,10 @@ class WAMVEnv:
         # 限制动作范围并发送推力命令
         clipped_action = np.clip(action, -1.0, 1.0)
         
-        # 为了实现向前20米的任务，强制左右推力都为正，且相近
+        # 为了实现向前20米的任务，强制左右推力都为正，且有最小值
         # 这样船只会主要向前移动
-        left_thrust = 0.5 * (clipped_action[0] + 1.0)  # 映射到[0, 1]范围
-        right_thrust = 0.5 * (clipped_action[1] + 1.0)  # 映射到[0, 1]范围
+        left_thrust = max(0.3, 0.5 * (clipped_action[0] + 1.0))  # 映射到[0.3, 1.0]范围
+        right_thrust = max(0.3, 0.5 * (clipped_action[1] + 1.0))  # 映射到[0.3, 1.0]范围
         
         # 发送推力命令
         self.send_thrust_cmd(left_thrust, right_thrust)
@@ -431,20 +466,37 @@ class WAMVEnv:
         else:
             safety_reward = 0.5
         
-        # 前进方向奖励：鼓励船只保持前进方向
-        # 前方视野中的平均距离（-30度到30度）
-        front_indices = [i % self.lidar_points for i in range(
-            int(self.lidar_points * 11/12),
-            int(self.lidar_points * 1/12)
-        )]
-        front_distances = lidar_scan[front_indices]
-        heading_reward = 0.3 * np.mean(front_distances) / 10.0  # 归一化
+        # 前进方向奖励：鼓励船只朝前方开阔的方向行驶
+        # 获取前方区域的索引（环绕处理）
+        front_indices = self.get_front_indices()
+        
+        # 安全处理前方区域数据
+        if front_indices and len(front_indices) > 0:
+            front_distances = lidar_scan[front_indices]
+            # 过滤无效值
+            valid_distances = front_distances[~np.isnan(front_distances) & ~np.isinf(front_distances)]
+            if len(valid_distances) > 0:
+                heading_reward = 0.3 * min(np.mean(valid_distances), 10.0) / 10.0
+            else:
+                heading_reward = 0.1  # 默认值
+        else:
+            heading_reward = 0.1  # 默认值
         
         # 平衡左右推力奖励：鼓励船只直线前进
-        thrust_balance_reward = 0.1 * (1.0 - abs(self.last_action[0] - self.last_action[1]))
+        try:
+            thrust_balance_reward = 0.1 * (1.0 - abs(self.last_action[0] - self.last_action[1]))
+            if np.isnan(thrust_balance_reward) or np.isinf(thrust_balance_reward):
+                thrust_balance_reward = 0.0
+        except:
+            thrust_balance_reward = 0.0
         
         # 总奖励：前进 + 安全 + 方向 + 平衡
         total_reward = progress_reward + safety_reward + heading_reward + thrust_balance_reward
+        
+        # 检查是否有NaN
+        if np.isnan(total_reward) or np.isinf(total_reward):
+            rospy.logwarn("奖励计算出现NaN/Inf，使用默认奖励值")
+            total_reward = 0.1  # 小的正奖励
         
         # 记录调试信息
         if self.step_count % 20 == 0:  # 每20步记录一次，避免日志过多
@@ -551,7 +603,7 @@ class PPOAgent:
 def train_forward_navigation():
     """训练强化学习代理实现向前导航并避障的任务"""
     # 环境配置
-    env = WAMVEnv(lidar_points=360, max_episode_steps=500, target_distance=20.0)
+    env = WAMVEnv(lidar_points=360, max_episode_steps=1000, target_distance=20.0)
     
     # 状态维度需要+1，因为添加了距离信息
     state_dim = env.observation_space.shape[0]
@@ -560,9 +612,9 @@ def train_forward_navigation():
     # 创建PPO代理
     agent = PPOAgent(state_dim, action_dim)
     
-    # 训练参数 - 减小buffer_size以更频繁更新
-    episodes = 200  # 减少训练回合数
-    buffer_size = 2000  # 减小缓冲区大小以更快更新策略
+    # 训练参数
+    episodes = 200  # 训练回合数
+    buffer_size = 2000  # 缓冲区大小
     batch_size = 64
     buffer = PPOBuffer(state_dim, action_dim, buffer_size)
     
@@ -682,7 +734,7 @@ def run_forward_test(model_episode="final", test_episodes=1):
     只是前进20米并避障，不使用强化学习训练
     """
     # 环境配置
-    env = WAMVEnv(lidar_points=360, max_episode_steps=500, target_distance=20.0)
+    env = WAMVEnv(lidar_points=360, max_episode_steps=1000, target_distance=20.0)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     
